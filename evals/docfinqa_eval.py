@@ -1,45 +1,59 @@
 #!/usr/bin/env python3
 """
-DocFinQA Evaluation Script using OpenAI Responses API (Agents SDK)
+DocFinQA Evaluation Script using OpenAI Responses API
 
 === WHAT THIS SCRIPT DOES ===
 This script evaluates how well OpenAI's AI models can answer financial questions
-by reading through financial documents using the new Responses API with file_search tool.
+using three different evaluation modes that test different capabilities.
+
+=== EVALUATION MODES ===
+1. **file_search**: Uses OpenAI's file_search tool with vector stores (default)
+   - Uploads financial documents to OpenAI's searchable database
+   - Uses file_search tool to find relevant information
+   - Tests the model's ability to search and retrieve information
+   - Supports query rewriting and search result inclusion
+   
+2. **closed_book**: Tests model's base financial knowledge without context
+   - No financial documents provided to the model
+   - Tests what the model knows from its training data
+   - Useful for understanding baseline capabilities
+   
+3. **context_window**: Provides full context directly in the prompt
+   - Includes the entire financial document in the prompt
+   - Tests the model's reasoning with complete information
+   - Limited by model's context window size
 
 === HOW IT WORKS ===
 1. Takes a JSON file with financial documents and questions about them
-2. For each question:
-   - Uploads the financial document to OpenAI's vector store (searchable database)
-   - Uses the Responses API with file_search tool to answer the question
-   - Compares the answer to the correct answer using numerical scoring
-   - Cleans up (deletes the temporary document storage)
-3. Calculates overall performance statistics
-4. Saves detailed results to a JSON file
-
-=== KEY CONCEPTS FOR BEGINNERS ===
-- Vector Store: A searchable database where OpenAI stores your documents
-- Responses API: The new stateful API that can use tools like file_search
-- file_search: A tool that lets the AI search through uploaded documents
-- Agents SDK: The modern way to build AI applications with OpenAI
+2. For each question, uses the specified evaluation mode to get an answer
+3. Compares the answer to the correct answer using numerical scoring
+4. Calculates overall performance statistics
+5. Saves detailed results to a JSON file
 
 === USAGE EXAMPLES ===
-Basic usage (all test cases):
+
+Basic file_search mode (default):
     python docfinqa_eval.py
 
-Test with just 5 cases:
-    python docfinqa_eval.py --limit 5 --output test_results.json
+Test closed book mode (no context):
+    python docfinqa_eval.py --evaluation-mode closed_book --limit 5
+
+Test context window mode (full context in prompt):
+    python docfinqa_eval.py --evaluation-mode context_window --limit 5
+
+File search with query rewriting:
+    python docfinqa_eval.py --evaluation-mode file_search --rewrite-queries --limit 5
+
+File search with search results included:
+    python docfinqa_eval.py --evaluation-mode file_search --include-search-results --limit 5
+
+Compare all modes on same dataset:
+    python docfinqa_eval.py --evaluation-mode file_search --limit 10 --output results_file_search.json
+    python docfinqa_eval.py --evaluation-mode closed_book --limit 10 --output results_closed_book.json
+    python docfinqa_eval.py --evaluation-mode context_window --limit 10 --output results_context_window.json
 
 Use different model:
-    python docfinqa_eval.py --model gpt-4o-mini --limit 10
-
-Enable query rewriting for better search:
-    python docfinqa_eval.py --rewrite-queries --limit 5
-
-Include file search results in output and JSON (for debugging/analysis):
-    python docfinqa_eval.py --include-search-results --limit 5
-
-Use both query rewriting and search results:
-    python docfinqa_eval.py --rewrite-queries --include-search-results --limit 5
+    python docfinqa_eval.py --model gpt-4o-mini --evaluation-mode closed_book --limit 10
 """
 
 # === PYTHON STANDARD LIBRARY IMPORTS ===
@@ -74,10 +88,19 @@ from scorer import score_response, calculate_aggregate_scores
 # === LOGGING SETUP ===
 # Configure logging so we can see what's happening during evaluation
 logging.basicConfig(
-    level=getattr(logging, os.getenv('OPENAI_LOG_LEVEL', 'INFO')),  # Log level from env var
+    level=getattr(logging, os.getenv('OPENAI_LOG_LEVEL', 'WARNING')),  # Changed from INFO to WARNING
     format='%(asctime)s - %(levelname)s - %(message)s'              # Log format with timestamp
 )
 logger = logging.getLogger(__name__)  # Create logger for this script
+
+# Suppress OpenAI and HTTP request logging unless specifically requested
+if not os.getenv('OPENAI_LOG_LEVEL'):
+    logging.getLogger('openai').setLevel(logging.ERROR)
+    logging.getLogger('httpx').setLevel(logging.ERROR)
+    logging.getLogger('httpcore').setLevel(logging.ERROR)
+    # Also suppress any other noisy loggers
+    logging.getLogger('urllib3').setLevel(logging.ERROR)
+    logging.getLogger('requests').setLevel(logging.ERROR)
 
 # === DATA STRUCTURES ===
 # These are simple data containers to organize our information
@@ -168,7 +191,8 @@ class DocFinQAEvaluator:
                  max_retries: int = 3,
                  retry_delay: float = 1.0,
                  use_query_rewriting: bool = False,
-                 include_search_results: bool = False):
+                 include_search_results: bool = False,
+                 evaluation_mode: str = "file_search"):
         """
         Initialize the evaluator - sets up connection to OpenAI and configuration
         
@@ -177,12 +201,25 @@ class DocFinQAEvaluator:
             model: Which AI model to use (gpt-4o, gpt-4o-mini, etc.)
             max_retries: How many times to retry if API calls fail
             retry_delay: How long to wait between retries (in seconds)
-            use_query_rewriting: Whether to rewrite queries before file search
-            include_search_results: Whether to include file search results in response
+            use_query_rewriting: Whether to rewrite queries before file search (only for file_search mode)
+            include_search_results: Whether to include file search results in response (only for file_search mode)
+            evaluation_mode: Evaluation mode - "file_search", "closed_book", or "context_window"
             
         Example:
-            evaluator = DocFinQAEvaluator(model="gpt-4o-mini", max_retries=5, use_query_rewriting=True)
+            evaluator = DocFinQAEvaluator(model="gpt-4o-mini", evaluation_mode="closed_book")
+            evaluator = DocFinQAEvaluator(model="gpt-4o-mini", evaluation_mode="context_window")
+            evaluator = DocFinQAEvaluator(model="gpt-4o-mini", evaluation_mode="file_search", use_query_rewriting=True)
         """
+        # Validate evaluation mode
+        valid_modes = ["file_search", "closed_book", "context_window"]
+        if evaluation_mode not in valid_modes:
+            raise ValueError(f"evaluation_mode must be one of {valid_modes}, got: {evaluation_mode}")
+            
+        # Disable OpenAI client logging if not explicitly requested
+        if not os.getenv('OPENAI_LOG_LEVEL'):
+            # Set environment variable to suppress OpenAI HTTP logging
+            os.environ['OPENAI_LOG_LEVEL'] = 'error'
+            
         # Create OpenAI client - this is our connection to OpenAI's servers
         self.client = OpenAI(api_key=api_key or os.getenv('OPENAI_API_KEY'))
         
@@ -190,10 +227,20 @@ class DocFinQAEvaluator:
         self.model = model or os.getenv('OPENAI_MODEL', 'gpt-4.1-mini')  # AI model to use
         self.max_retries = max_retries      # How many times to retry failed calls
         self.retry_delay = retry_delay      # Seconds to wait between retries
-        self.use_query_rewriting = use_query_rewriting  # Whether to rewrite queries
-        self.include_search_results = include_search_results  # Whether to include search results
+        self.evaluation_mode = evaluation_mode  # Which evaluation mode to use
         
-        logger.info(f"Initialized DocFinQA Evaluator with model: {self.model}, query rewriting: {self.use_query_rewriting}, include search results: {self.include_search_results}")
+        # File search specific settings (only used when evaluation_mode is "file_search")
+        self.use_query_rewriting = use_query_rewriting if evaluation_mode == "file_search" else False
+        self.include_search_results = include_search_results if evaluation_mode == "file_search" else False
+        
+        # Log warnings if file_search-specific options are used with other modes
+        if evaluation_mode != "file_search":
+            if use_query_rewriting:
+                logger.warning("Query rewriting is only available in file_search mode, ignoring --rewrite-queries")
+            if include_search_results:
+                logger.warning("Search results inclusion is only available in file_search mode, ignoring --include-search-results")
+        
+        print(f"Initialized DocFinQA Evaluator with model: {self.model}, mode: {self.evaluation_mode}, query rewriting: {self.use_query_rewriting}, include search results: {self.include_search_results}")
         
     def load_test_data(self, file_path: str, limit: Optional[int] = None) -> List[TestCase]:
         """
@@ -209,7 +256,7 @@ class DocFinQAEvaluator:
         Example:
             test_cases = evaluator.load_test_data("data/test-data-sample.json", limit=10)
         """
-        logger.info(f"Loading test data from {file_path}")
+        print(f"Loading test data from {file_path}")
         
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -225,7 +272,7 @@ class DocFinQAEvaluator:
                 )
                 test_cases.append(test_case)
                 
-            logger.info(f"Loaded {len(test_cases)} test cases")
+            print(f"Loaded {len(test_cases)} test cases")
             return test_cases
             
         except Exception as e:
@@ -298,7 +345,7 @@ class DocFinQAEvaluator:
                 )
                 
                 if vector_store_files.data and vector_store_files.data[0].status == 'completed':
-                    logger.debug(f"Vector store file processing completed in {wait_time}s")
+                    # Removed verbose logging - file processing completed quietly
                     break
                 elif vector_store_files.data and vector_store_files.data[0].status == 'failed':
                     raise RuntimeError(f"Vector store file processing failed: {vector_store_files.data[0].last_error}")
@@ -308,12 +355,12 @@ class DocFinQAEvaluator:
                 
                 # Log progress every 30 seconds
                 if wait_time % 30 == 0:
-                    logger.info(f"Still processing vector store file... ({wait_time}s elapsed)")
+                    print(f"Still processing vector store file... ({wait_time}s elapsed)")
                 
             if wait_time >= max_wait:
                 raise TimeoutError(f"Vector store file processing timed out after {max_wait} seconds")
                 
-            logger.debug(f"Created vector store {vector_store.id} with context document")
+            # Removed verbose logging - vector store created quietly
             return vector_store.id
             
         finally:
@@ -368,7 +415,7 @@ Rewritten search query:"""
             rewritten_query = rewritten_query.strip()
             
             if rewritten_query:
-                logger.debug(f"Query rewritten from: '{original_query}' to: '{rewritten_query}'")
+                # Query rewriting successful - no verbose logging needed
                 return rewritten_query
             else:
                 logger.warning("Query rewriting failed, using original query")
@@ -393,7 +440,7 @@ Rewritten search query:"""
         """
         try:
             search_results = []
-            logger.debug("Starting search result extraction...")
+            # Removed verbose debug logging - extracting quietly
             
             # According to the documentation, when include=["output[*].file_search_call.search_results"] is used,
             # the search results should be available in the response output
@@ -401,22 +448,17 @@ Rewritten search query:"""
                 for output_item in response.output:
                     # Look for file_search_call type in output
                     if hasattr(output_item, 'type') and output_item.type == 'file_search_call':
-                        logger.debug(f"Found file_search_call output: {type(output_item)}")
                         # Check if there are results in this output (note: it's 'results', not 'search_results')
                         if hasattr(output_item, 'results'):
-                            logger.debug(f"Found results attribute with {len(output_item.results)} results")
                             for result in output_item.results:
                                 result_dict = self._extract_single_result(result)
                                 if result_dict:
                                     search_results.append(result_dict)
-                        else:
-                            logger.debug(f"file_search_call found but no results attribute. Available attributes: {[attr for attr in dir(output_item) if not attr.startswith('_')]}")
                     
                     # Also check if this output has annotations (alternative way search results might be exposed)
                     elif hasattr(output_item, 'content') and output_item.content:
                         for content_item in output_item.content:
                             if hasattr(content_item, 'annotations') and content_item.annotations:
-                                logger.debug(f"Found annotations in content: {len(content_item.annotations)} items")
                                 for annotation in content_item.annotations:
                                     if hasattr(annotation, 'filename'):  # This indicates it's a file search result
                                         result_dict = self._extract_single_result(annotation)
@@ -425,39 +467,21 @@ Rewritten search query:"""
             
             # If no results found through output, try alternative approach
             if not search_results:
-                logger.debug("No search results found in output, trying alternative extraction...")
                 # Sometimes the include data might be in a separate attribute
                 for attr_name in ['include', 'included', 'search_results', 'tool_results']:
                     if hasattr(response, attr_name):
                         attr_value = getattr(response, attr_name)
-                        logger.debug(f"Checking {attr_name}: {type(attr_value)}")
                         if attr_value:
                             self._deep_inspect_response(attr_value, depth=0, max_depth=2)
             
-            # Log final results
-            if search_results:
-                logger.debug(f"Successfully extracted {len(search_results)} search results")
-                for i, result in enumerate(search_results):
-                    logger.debug(f"Result {i}: {list(result.keys())}")
-            else:
+            # Only log if search results extraction fails
+            if not search_results and self.include_search_results:
                 logger.warning("No search results found in response - extraction failed")
-                # Log the full response structure for debugging
-                logger.debug("=== FULL RESPONSE DEBUG ===")
-                logger.debug(f"Response type: {type(response)}")
-                logger.debug(f"Response attributes: {[attr for attr in dir(response) if not attr.startswith('_')]}")
-                if hasattr(response, 'output'):
-                    logger.debug(f"Output length: {len(response.output)}")
-                    for i, output in enumerate(response.output):
-                        logger.debug(f"Output {i} type: {getattr(output, 'type', 'no type')}")
-                        logger.debug(f"Output {i} attributes: {[attr for attr in dir(output) if not attr.startswith('_')]}")
-                logger.debug("=== END RESPONSE DEBUG ===")
                 
             return search_results if search_results else None
             
         except Exception as e:
             logger.error(f"Error extracting search results: {e}")
-            import traceback
-            logger.debug(f"Full error traceback: {traceback.format_exc()}")
             return None
     
     def _extract_single_result(self, result) -> Optional[Dict]:
@@ -493,14 +517,11 @@ Rewritten search query:"""
             
             # If we found any data, return it
             if result_dict:
-                logger.debug(f"Extracted result attributes: {list(result_dict.keys())}")
                 return result_dict
             else:
-                logger.debug(f"No extractable attributes found in result: {[attr for attr in dir(result) if not attr.startswith('_')]}")
                 return None
             
         except Exception as e:
-            logger.debug(f"Error extracting single result: {e}")
             return None
     
     def _deep_inspect_response(self, obj, depth=0, max_depth=3):
@@ -508,25 +529,21 @@ Rewritten search query:"""
         if depth > max_depth:
             return
             
-        indent = "  " * depth
-        logger.debug(f"{indent}Inspecting {type(obj)}")
-        
+        # Simplified inspection - no verbose logging
         if hasattr(obj, '__dict__'):
             for attr_name, attr_value in obj.__dict__.items():
                 if 'search' in attr_name.lower() or 'result' in attr_name.lower() or 'file' in attr_name.lower():
-                    logger.debug(f"{indent}Found interesting attribute: {attr_name} = {type(attr_value)}")
                     if depth < max_depth and attr_value is not None:
                         self._deep_inspect_response(attr_value, depth + 1, max_depth)
                 
     def evaluate_single_case(self, test_case: TestCase, case_index: int) -> EvalResult:
         """
-        Evaluate a single test case using the Responses API
+        Evaluate a single test case using the specified evaluation mode
         
-        This method takes one financial question and document, then:
-        1. Uploads the document to OpenAI as a searchable vector store
-        2. Uses the Responses API with file_search tool to answer the question
-        3. Scores the response for accuracy
-        4. Cleans up all the temporary resources
+        This method takes one financial question and document, then evaluates it using one of three modes:
+        1. "file_search": Uploads document to vector store and uses file_search tool (original behavior)
+        2. "closed_book": Asks the question without any context (tests base model knowledge)
+        3. "context_window": Provides context directly in the prompt (tests reasoning with full context)
         
         Args:
             test_case: The test case to evaluate (document + question + expected answer)
@@ -543,13 +560,51 @@ Rewritten search query:"""
         # Record when we started (for timing how long this takes)
         start_time = time.time()
         
-        # Initialize tracking variables for OpenAI resources
-        vector_store_id = None  # Where we store the document
+        # Initialize tracking variables
+        vector_store_id = None  # Only used for file_search mode
         response_id = None      # The Responses API response ID
         
         try:
-            logger.info(f"Evaluating test case {case_index + 1}")
+            print(f"Evaluating test case {case_index + 1}...")
             
+            # Route to appropriate evaluation method based on mode
+            if self.evaluation_mode == "file_search":
+                return self._evaluate_file_search_mode(test_case, case_index, start_time)
+            elif self.evaluation_mode == "closed_book":
+                return self._evaluate_closed_book_mode(test_case, case_index, start_time)
+            elif self.evaluation_mode == "context_window":
+                return self._evaluate_context_window_mode(test_case, case_index, start_time)
+            else:
+                raise ValueError(f"Unknown evaluation mode: {self.evaluation_mode}")
+                
+        except Exception as e:
+            # Something went wrong - log the error and return a failed result
+            logger.error(f"Error evaluating test case {case_index + 1}: {e}")
+            execution_time = time.time() - start_time
+            
+            return EvalResult(
+                test_case=test_case,
+                model_response="",                           # No response due to error
+                execution_time=execution_time,
+                vector_store_id=vector_store_id or "",       # Might be None if creation failed
+                response_id=response_id or "",               # Might be None if API call failed
+                success=False,                               # Mark as failed
+                error_message=str(e)                         # What went wrong
+            )
+            
+    def _evaluate_file_search_mode(self, test_case: TestCase, case_index: int, start_time: float) -> EvalResult:
+        """
+        Evaluate using file_search mode (original behavior)
+        
+        1. Uploads the document to OpenAI as a searchable vector store
+        2. Uses the Responses API with file_search tool to answer the question
+        3. Scores the response for accuracy
+        4. Cleans up all the temporary resources
+        """
+        vector_store_id = None
+        response_id = None
+        
+        try:
             # === STEP 1: UPLOAD DOCUMENT ===
             # Create a vector store (searchable database) with the financial document
             vector_store_id = self.create_vector_store_with_context(
@@ -625,9 +680,8 @@ Finish with a single line with only your numerical or logical answer under the h
             rewritten_query = None
             
             if self.include_search_results:
-                logger.debug("=== ATTEMPTING SEARCH RESULTS EXTRACTION ===")
+                # Removed verbose debug logging
                 search_results = self.extract_search_results(response)
-                logger.debug(f"Extraction completed. Results: {search_results is not None}")
                 
             if self.use_query_rewriting:
                 rewritten_query = search_question
@@ -639,7 +693,7 @@ Finish with a single line with only your numerical or logical answer under the h
             # Calculate execution time
             execution_time = time.time() - start_time
             
-            logger.info(f"Successfully evaluated test case {case_index + 1} in {execution_time:.2f}s")
+            # Removed verbose completion message
             
             # Return successful result with scoring information
             return EvalResult(
@@ -659,26 +713,152 @@ Finish with a single line with only your numerical or logical answer under the h
                 search_results=search_results
             )
             
-        except Exception as e:
-            # Something went wrong - log the error and return a failed result
-            logger.error(f"Error evaluating test case {case_index + 1}: {e}")
-            execution_time = time.time() - start_time
-            
-            return EvalResult(
-                test_case=test_case,
-                model_response="",                           # No response due to error
-                execution_time=execution_time,
-                vector_store_id=vector_store_id or "",       # Might be None if creation failed
-                response_id=response_id or "",               # Might be None if API call failed
-                success=False,                               # Mark as failed
-                error_message=str(e)                         # What went wrong
-            )
-            
         finally:
             # === CLEANUP ===  
             # This runs whether we succeeded or failed
             # Always clean up OpenAI resources to avoid charges
             self.cleanup_resources(vector_store_id)
+            
+    def _evaluate_closed_book_mode(self, test_case: TestCase, case_index: int, start_time: float) -> EvalResult:
+        """
+        Evaluate using closed_book mode
+        
+        Asks the question without any context to test the model's base knowledge.
+        This tests what the model knows about financial concepts without access to documents.
+        """
+        try:
+            # Create prompt with just the question and instructions
+            prompt = f"""### Question
+{test_case.question}
+
+### Instructions
+Answer the question based on your knowledge. Do not use any external tools or search functions.
+
+Work step by step under the header REASONING: and explain your thinking.
+Finish with a single line with only your numerical or logical answer under the header FINAL: <answer>
+"""
+            
+            # Use the Responses API without any tools
+            response = self.client.responses.create(
+                model=self.model,
+                input=prompt
+            )
+            
+            response_id = response.id
+            
+            # Extract the AI's response text
+            model_response = ""
+            for output in response.output:
+                if hasattr(output, 'content') and output.content:
+                    for content in output.content:
+                        if hasattr(content, 'text'):
+                            model_response += content.text + "\n"
+            
+            model_response = model_response.strip()
+            
+            # === SCORE THE RESPONSE ===
+            # Use our custom scoring system to evaluate the response
+            scoring_result = score_response(model_response, test_case.expected_answer)
+            
+            # Calculate execution time
+            execution_time = time.time() - start_time
+            
+            # Removed verbose completion message
+            
+            # Return successful result with scoring information
+            return EvalResult(
+                test_case=test_case,
+                model_response=model_response,
+                execution_time=execution_time,
+                vector_store_id="",  # No vector store used
+                response_id=response_id,
+                success=True,
+                # Scoring information from our custom scorer (ScoreResult object)
+                numerical_accuracy=scoring_result.numerical_accuracy,
+                extracted_number=scoring_result.extracted_number,
+                expected_number=scoring_result.expected_number,
+                found_final_tag=scoring_result.found_final_tag,
+                # No search information in closed book mode
+                rewritten_query=None,
+                search_results=None
+            )
+            
+        except Exception as e:
+            execution_time = time.time() - start_time
+            raise e  # Re-raise to be caught by main evaluate_single_case method
+            
+    def _evaluate_context_window_mode(self, test_case: TestCase, case_index: int, start_time: float) -> EvalResult:
+        """
+        Evaluate using context_window mode
+        
+        Provides the entire context directly in the prompt to test the model's reasoning
+        ability when given full access to the financial document.
+        """
+        try:
+            # Create prompt with context provided directly
+            prompt = f"""### Context
+<context>
+{test_case.context}
+</context>
+
+### Question
+{test_case.question}
+
+### Instructions
+Answer the question based on the context provided above. Do not use any external tools or search functions.
+
+Work step by step under the header REASONING: and explain your thinking.
+Finish with a single line with only your numerical or logical answer under the header FINAL: <answer>
+"""
+            
+            # Use the Responses API without any tools
+            response = self.client.responses.create(
+                model=self.model,
+                input=prompt
+            )
+            
+            response_id = response.id
+            
+            # Extract the AI's response text
+            model_response = ""
+            for output in response.output:
+                if hasattr(output, 'content') and output.content:
+                    for content in output.content:
+                        if hasattr(content, 'text'):
+                            model_response += content.text + "\n"
+            
+            model_response = model_response.strip()
+            
+            # === SCORE THE RESPONSE ===
+            # Use our custom scoring system to evaluate the response
+            scoring_result = score_response(model_response, test_case.expected_answer)
+            
+            # Calculate execution time
+            execution_time = time.time() - start_time
+            
+            # Removed verbose completion message
+            
+            # Return successful result with scoring information
+            return EvalResult(
+                test_case=test_case,
+                model_response=model_response,
+                execution_time=execution_time,
+                vector_store_id="",  # No vector store used
+                response_id=response_id,
+                success=True,
+                # Scoring information from our custom scorer (ScoreResult object)
+                numerical_accuracy=scoring_result.numerical_accuracy,
+                extracted_number=scoring_result.extracted_number,
+                expected_number=scoring_result.expected_number,
+                found_final_tag=scoring_result.found_final_tag,
+                # No search information in context window mode
+                rewritten_query=None,
+                search_results=None
+            )
+            
+        except Exception as e:
+            execution_time = time.time() - start_time
+            raise e  # Re-raise to be caught by main evaluate_single_case method
             
     def cleanup_resources(self, vector_store_id: Optional[str]):
         """
@@ -693,11 +873,11 @@ Finish with a single line with only your numerical or logical answer under the h
                 try:
                     # Try new path first (v1.66.x+)
                     self.client.vector_stores.delete(vector_store_id)
-                    logger.debug(f"Deleted vector store {vector_store_id}")
+                    # Removed verbose logging
                 except AttributeError:
                     # Fall back to beta path for older versions
                     self.client.beta.vector_stores.delete(vector_store_id)
-                    logger.debug(f"Deleted vector store {vector_store_id}")
+                    # Removed verbose logging
         except Exception as e:
             logger.warning(f"Failed to delete vector store {vector_store_id}: {e}")
             
@@ -713,7 +893,7 @@ Finish with a single line with only your numerical or logical answer under the h
         """
         results = []
         
-        logger.info(f"Starting evaluation of {len(test_cases)} test cases")
+        print(f"Starting evaluation of {len(test_cases)} test cases")
         
         for i, test_case in enumerate(test_cases):
             try:
@@ -784,6 +964,9 @@ Finish with a single line with only your numerical or logical answer under the h
             
             # Metadata
             'model_used': self.model,
+            'evaluation_mode': self.evaluation_mode,
+            'query_rewriting_enabled': self.use_query_rewriting,
+            'search_results_included': self.include_search_results,
             'timestamp': datetime.now().isoformat(),
             'scored_cases': len(successful_results)
         }
@@ -833,7 +1016,7 @@ Finish with a single line with only your numerical or logical answer under the h
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(output_data, f, indent=2, ensure_ascii=False)
             
-        logger.info(f"Results saved to {output_file}")
+        print(f"Results saved to {output_file}")
 
 def main():
     """Main entry point for the evaluation script"""
@@ -845,7 +1028,7 @@ def main():
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     default_output = os.path.join(results_dir, f'docfinqa_eval_{timestamp}.json')
     
-    parser = argparse.ArgumentParser(description='DocFinQA Evaluation using OpenAI Responses API (Agents SDK)')
+    parser = argparse.ArgumentParser(description='DocFinQA Evaluation using OpenAI Responses API')
     parser.add_argument('--data', '-d', 
                        default='data/test-data-sample.json',
                        help='Path to test data JSON file')
@@ -864,12 +1047,23 @@ def main():
     parser.add_argument('--include-search-results', 
                        action='store_true',
                        help='Include file search results in the response and save them in the JSON output')
+    parser.add_argument('--evaluation-mode', '-e',
+                       default='file_search',
+                       choices=['file_search', 'closed_book', 'context_window'],
+                       help='Evaluation mode: "file_search" (uses file_search tool), "closed_book" (no context), or "context_window" (context in prompt)')
     
     args = parser.parse_args()
     
+    # Validate argument combinations
+    if args.evaluation_mode != 'file_search':
+        if args.rewrite_queries:
+            print("Warning: --rewrite-queries only works with file_search mode")
+        if args.include_search_results:
+            print("Warning: --include-search-results only works with file_search mode")
+    
     # Check for required environment variables
     if not os.getenv('OPENAI_API_KEY'):
-        logger.error("OPENAI_API_KEY environment variable is required")
+        print("Error: OPENAI_API_KEY environment variable is required")
         sys.exit(1)
         
     try:
@@ -877,14 +1071,15 @@ def main():
         evaluator = DocFinQAEvaluator(
             model=args.model, 
             use_query_rewriting=args.rewrite_queries,
-            include_search_results=args.include_search_results
+            include_search_results=args.include_search_results,
+            evaluation_mode=args.evaluation_mode
         )
         
         # Load test data
         test_cases = evaluator.load_test_data(args.data, args.limit)
         
         if not test_cases:
-            logger.error("No test cases loaded")
+            print("Error: No test cases loaded")
             sys.exit(1)
             
         # Run evaluation
@@ -908,7 +1103,7 @@ def main():
         print(f"Results saved to: {args.output}")
         
     except Exception as e:
-        logger.error(f"Evaluation failed: {e}")
+        print(f"Error: Evaluation failed: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
