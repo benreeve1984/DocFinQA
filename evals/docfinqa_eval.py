@@ -1017,6 +1017,176 @@ Finish with a single line with only your numerical or logical answer under the h
             json.dump(output_data, f, indent=2, ensure_ascii=False)
             
         print(f"Results saved to {output_file}")
+        
+    def save_incremental_results(self, results: List[EvalResult], output_file: str, total_expected: int = None):
+        """
+        Save results incrementally after each test case
+        
+        Args:
+            results: List of evaluation results so far
+            output_file: Path to output file
+            total_expected: Total number of test cases expected (for progress tracking)
+        """
+        # Calculate partial metrics for current results
+        partial_metrics = self.calculate_metrics(results)
+        
+        # Add progress information if total is known
+        if total_expected:
+            partial_metrics['progress'] = {
+                'completed_cases': len(results),
+                'total_cases': total_expected,
+                'completion_percentage': (len(results) / total_expected) * 100,
+                'is_complete': len(results) >= total_expected
+            }
+        
+        # Save the results
+        self.save_results(results, partial_metrics, output_file)
+        
+    def load_existing_results(self, output_file: str) -> List[EvalResult]:
+        """
+        Load existing results from a JSON file to enable resumption
+        
+        Args:
+            output_file: Path to existing results file
+            
+        Returns:
+            List of EvalResult objects from the existing file
+        """
+        if not os.path.exists(output_file):
+            return []
+            
+        try:
+            with open(output_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            results = []
+            for result_data in data.get('results', []):
+                # Reconstruct TestCase
+                test_case = TestCase(
+                    context="",  # We don't store context in results to save space
+                    question=result_data['question'],
+                    expected_answer=result_data['expected_answer'],
+                    program=""
+                )
+                
+                # Reconstruct EvalResult
+                result = EvalResult(
+                    test_case=test_case,
+                    model_response=result_data['model_response'],
+                    execution_time=result_data['execution_time'],
+                    vector_store_id=result_data['vector_store_id'],
+                    response_id=result_data['response_id'],
+                    success=result_data['success'],
+                    error_message=result_data['error_message'],
+                    numerical_accuracy=result_data['numerical_accuracy'],
+                    extracted_number=result_data['extracted_number'],
+                    expected_number=result_data['expected_number'],
+                    found_final_tag=result_data['found_final_tag'],
+                    rewritten_query=result_data['rewritten_query'],
+                    search_results=result_data['search_results']
+                )
+                results.append(result)
+                
+            print(f"Loaded {len(results)} existing results from {output_file}")
+            return results
+            
+        except Exception as e:
+            print(f"Warning: Could not load existing results from {output_file}: {e}")
+            return []
+            
+    def find_completed_cases(self, existing_results: List[EvalResult], all_test_cases: List[TestCase]) -> set:
+        """
+        Find which test cases have already been completed
+        
+        Args:
+            existing_results: Previously completed results
+            all_test_cases: All test cases that need to be run
+            
+        Returns:
+            Set of indices of completed test cases
+        """
+        completed_indices = set()
+        
+        # Create a map of questions to their indices in all_test_cases
+        question_to_index = {case.question: i for i, case in enumerate(all_test_cases)}
+        
+        # Find which questions have been completed
+        for result in existing_results:
+            question = result.test_case.question
+            if question in question_to_index:
+                completed_indices.add(question_to_index[question])
+                
+        return completed_indices
+        
+    def evaluate_all_with_resume(self, test_cases: List[TestCase], output_file: str) -> List[EvalResult]:
+        """
+        Evaluate all test cases with automatic resume capability
+        
+        Args:
+            test_cases: List of test cases to evaluate
+            output_file: Path to output file (will be used for incremental saves)
+            
+        Returns:
+            List of EvalResult objects
+        """
+        # Load any existing results
+        existing_results = self.load_existing_results(output_file)
+        completed_indices = self.find_completed_cases(existing_results, test_cases)
+        
+        # Start with existing results
+        results = existing_results.copy()
+        
+        total_cases = len(test_cases)
+        remaining_cases = total_cases - len(completed_indices)
+        
+        if completed_indices:
+            print(f"Found {len(completed_indices)} already completed test cases")
+            print(f"Resuming evaluation with {remaining_cases} remaining cases")
+        else:
+            print(f"Starting fresh evaluation of {total_cases} test cases")
+        
+        if remaining_cases == 0:
+            print("All test cases already completed!")
+            return results
+            
+        for i, test_case in enumerate(test_cases):
+            # Skip if already completed
+            if i in completed_indices:
+                continue
+                
+            try:
+                print(f"Evaluating test case {i + 1}/{total_cases} (remaining: {len(test_cases) - i - len([x for x in completed_indices if x <= i])})")
+                
+                result = self.evaluate_single_case(test_case, i)
+                results.append(result)
+                
+                # Save incrementally after each test case
+                try:
+                    self.save_incremental_results(results, output_file, total_cases)
+                except Exception as save_error:
+                    print(f"Warning: Failed to save incremental results: {save_error}")
+                
+                # Brief pause between evaluations to avoid rate limits
+                time.sleep(1)
+                
+            except KeyboardInterrupt:
+                print(f"\n⚠️  Evaluation interrupted by user!")
+                print(f"Progress saved to {output_file}")
+                print(f"Completed {len(results)} out of {total_cases} test cases")
+                print(f"To resume, run the same command again - it will continue from where it left off")
+                break
+                
+            except Exception as e:
+                logger.error(f"Fatal error on test case {i + 1}: {e}")
+                # Save progress even after errors
+                try:
+                    self.save_incremental_results(results, output_file, total_cases)
+                except Exception as save_error:
+                    print(f"Warning: Failed to save incremental results after error: {save_error}")
+                # Continue with next test case
+                continue
+                
+        return results
 
 def main():
     """Main entry point for the evaluation script"""
@@ -1083,7 +1253,7 @@ def main():
             sys.exit(1)
             
         # Run evaluation
-        results = evaluator.evaluate_all(test_cases)
+        results = evaluator.evaluate_all_with_resume(test_cases, args.output)
         
         # Calculate metrics
         metrics = evaluator.calculate_metrics(results)

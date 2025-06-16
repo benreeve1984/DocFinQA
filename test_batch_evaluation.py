@@ -11,10 +11,11 @@ import sys
 import subprocess
 import time
 from datetime import datetime
+import json
 
 def run_evaluation(mode_name, mode_args, limit=1):
     """
-    Run a single evaluation mode
+    Run a single evaluation mode with resume capability
     
     Args:
         mode_name: Descriptive name for the mode (used in filename)
@@ -22,11 +23,22 @@ def run_evaluation(mode_name, mode_args, limit=1):
         limit: Number of test cases to run
     
     Returns:
-        (success, output_file, duration)
+        (success, output_file, duration, completed_cases)
     """
-    # Generate timestamped filename
+    # Generate timestamped filename (but check for existing file first)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_file = f"results/docfinqa_eval_{mode_name}_{timestamp}.json"
+    base_output_file = f"results/docfinqa_eval_{mode_name}_{timestamp}.json"
+    
+    # Check for existing partial files with same mode name from today
+    existing_file = find_existing_partial_file(mode_name)
+    
+    if existing_file:
+        output_file = existing_file
+        print(f"🔄 Found existing partial results: {existing_file}")
+        print(f"   Will resume from where it left off...")
+    else:
+        output_file = base_output_file
+        print(f"🚀 Starting fresh {mode_name} evaluation...")
     
     # Build the command
     cmd = [
@@ -35,7 +47,6 @@ def run_evaluation(mode_name, mode_args, limit=1):
         "--output", output_file
     ] + mode_args
     
-    print(f"🚀 Starting {mode_name} evaluation...")
     print(f"   Command: {' '.join(cmd)}")
     print(f"   Output: {output_file}")
     
@@ -48,18 +59,81 @@ def run_evaluation(mode_name, mode_args, limit=1):
         duration = time.time() - start_time
         
         if result.returncode == 0:
-            print(f"✅ {mode_name} completed successfully in {duration:.1f}s")
-            print(f"   Results saved to: {output_file}")
-            return True, output_file, duration
+            # Check how many cases were actually completed
+            completed_cases = count_completed_cases(output_file)
+            
+            if completed_cases >= limit:
+                print(f"✅ {mode_name} completed successfully in {duration:.1f}s")
+                print(f"   All {completed_cases} test cases completed")
+            else:
+                print(f"⚠️  {mode_name} partially completed in {duration:.1f}s")
+                print(f"   Completed {completed_cases}/{limit} test cases")
+                print(f"   Results saved to: {output_file}")
+                print(f"   ⭐ Run the batch script again to resume from this point")
+                
+            return True, output_file, duration, completed_cases
         else:
             print(f"❌ {mode_name} failed!")
             print(f"   Error: {result.stderr}")
-            return False, None, duration
+            
+            # Check if we have any partial results
+            completed_cases = count_completed_cases(output_file) if os.path.exists(output_file) else 0
+            return False, output_file if completed_cases > 0 else None, duration, completed_cases
             
     except Exception as e:
         duration = time.time() - start_time
         print(f"❌ {mode_name} failed with exception: {e}")
-        return False, None, duration
+        
+        # Check if we have any partial results
+        completed_cases = count_completed_cases(output_file) if os.path.exists(output_file) else 0
+        return False, output_file if completed_cases > 0 else None, duration, completed_cases
+
+def find_existing_partial_file(mode_name):
+    """
+    Find existing partial result files for the given mode from today
+    
+    Args:
+        mode_name: Name of the evaluation mode
+        
+    Returns:
+        Path to existing file or None
+    """
+    if not os.path.exists('results'):
+        return None
+        
+    today = datetime.now().strftime('%Y%m%d')
+    pattern = f"docfinqa_eval_{mode_name}_{today}_*.json"
+    
+    import glob
+    matching_files = glob.glob(f"results/{pattern}")
+    
+    if matching_files:
+        # Return the most recent file
+        return max(matching_files, key=os.path.getctime)
+    
+    return None
+
+def count_completed_cases(output_file):
+    """
+    Count how many test cases have been completed in a results file
+    
+    Args:
+        output_file: Path to results file
+        
+    Returns:
+        Number of completed test cases
+    """
+    try:
+        if not os.path.exists(output_file):
+            return 0
+            
+        with open(output_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        return len(data.get('results', []))
+        
+    except Exception:
+        return 0
 
 def main():
     """Run test batch evaluation across all modes"""
@@ -110,7 +184,7 @@ def main():
         print(f"📋 Mode {i}/4: {mode['description']}")
         print("-" * 30)
         
-        success, output_file, duration = run_evaluation(
+        success, output_file, duration, completed_cases = run_evaluation(
             mode_name=mode['name'],
             mode_args=mode['args'],
             limit=1  # Just 1 test case for testing
@@ -121,7 +195,8 @@ def main():
             'description': mode['description'],
             'success': success,
             'output_file': output_file,
-            'duration': duration
+            'duration': duration,
+            'completed_cases': completed_cases
         })
         
         print()
@@ -150,6 +225,7 @@ def main():
                 print(f"   {result['description']}")
                 print(f"   └── {result['output_file']}")
                 print(f"       Duration: {result['duration']:.1f}s")
+                print(f"       Completed Cases: {result['completed_cases']}")
             else:
                 print(f"   {result['description']}: ❌ FAILED")
         
