@@ -31,6 +31,15 @@ Test with just 5 cases:
 
 Use different model:
     python docfinqa_eval.py --model gpt-4o-mini --limit 10
+
+Enable query rewriting for better search:
+    python docfinqa_eval.py --rewrite-queries --limit 5
+
+Include file search results in output and JSON (for debugging/analysis):
+    python docfinqa_eval.py --include-search-results --limit 5
+
+Use both query rewriting and search results:
+    python docfinqa_eval.py --rewrite-queries --include-search-results --limit 5
 """
 
 # === PYTHON STANDARD LIBRARY IMPORTS ===
@@ -106,6 +115,7 @@ class EvalResult:
     - Technical details (IDs for cleanup)
     - Whether it succeeded
     - Scoring information
+    - Search results (if enabled)
     
     Example:
         If we asked "What was Q3 revenue?" and expected "100":
@@ -113,6 +123,7 @@ class EvalResult:
         - numerical_accuracy would be 1.0 (perfect match)
         - extracted_number would be 100.0
         - success would be True
+        - search_results might contain the document chunks that were found
     """
     test_case: TestCase           # The original test case we evaluated
     model_response: str           # What the AI actually said
@@ -128,6 +139,11 @@ class EvalResult:
     extracted_number: Optional[float] = None    # Number we found in AI response
     expected_number: Optional[float] = None     # Number we expected to find
     found_final_tag: Optional[bool] = None      # Did AI use "FINAL: X" format?
+    
+    # === SEARCH INFORMATION ===
+    # These fields contain information about the search process
+    rewritten_query: Optional[str] = None       # Query after rewriting (if used)
+    search_results: Optional[List[Dict]] = None # File search results (if enabled)
     
 # === MAIN EVALUATOR CLASS ===
 # This is the heart of our evaluation system
@@ -150,7 +166,9 @@ class DocFinQAEvaluator:
                  api_key: Optional[str] = None,
                  model: str = "gpt-4.1-mini",
                  max_retries: int = 3,
-                 retry_delay: float = 1.0):
+                 retry_delay: float = 1.0,
+                 use_query_rewriting: bool = False,
+                 include_search_results: bool = False):
         """
         Initialize the evaluator - sets up connection to OpenAI and configuration
         
@@ -159,9 +177,11 @@ class DocFinQAEvaluator:
             model: Which AI model to use (gpt-4o, gpt-4o-mini, etc.)
             max_retries: How many times to retry if API calls fail
             retry_delay: How long to wait between retries (in seconds)
+            use_query_rewriting: Whether to rewrite queries before file search
+            include_search_results: Whether to include file search results in response
             
         Example:
-            evaluator = DocFinQAEvaluator(model="gpt-4o-mini", max_retries=5)
+            evaluator = DocFinQAEvaluator(model="gpt-4o-mini", max_retries=5, use_query_rewriting=True)
         """
         # Create OpenAI client - this is our connection to OpenAI's servers
         self.client = OpenAI(api_key=api_key or os.getenv('OPENAI_API_KEY'))
@@ -170,8 +190,10 @@ class DocFinQAEvaluator:
         self.model = model or os.getenv('OPENAI_MODEL', 'gpt-4.1-mini')  # AI model to use
         self.max_retries = max_retries      # How many times to retry failed calls
         self.retry_delay = retry_delay      # Seconds to wait between retries
+        self.use_query_rewriting = use_query_rewriting  # Whether to rewrite queries
+        self.include_search_results = include_search_results  # Whether to include search results
         
-        logger.info(f"Initialized DocFinQA Evaluator with model: {self.model}")
+        logger.info(f"Initialized DocFinQA Evaluator with model: {self.model}, query rewriting: {self.use_query_rewriting}, include search results: {self.include_search_results}")
         
     def load_test_data(self, file_path: str, limit: Optional[int] = None) -> List[TestCase]:
         """
@@ -301,6 +323,201 @@ class DocFinQAEvaluator:
             except:
                 pass
                 
+    def rewrite_query(self, original_query: str) -> str:
+        """
+        Rewrite the original query to be more effective for financial document search
+        
+        Args:
+            original_query: The original question from the test case
+            
+        Returns:
+            Rewritten query optimized for document search
+            
+        Example:
+            original: "what is the net change in net revenue during 2015?"
+            rewritten: "net revenue change 2015 increase decrease financial statement"
+        """
+        try:
+            # Create a prompt to rewrite the query for better document search
+            rewrite_prompt = f"""You are a financial document search expert. Rewrite the following question to create better search terms for finding relevant information in financial documents.
+
+Original question: {original_query}
+
+Guidelines for rewriting:
+1. Extract key financial terms, metrics, and time periods
+2. Add relevant synonyms that might appear in financial documents
+3. Focus on searchable keywords rather than question structure
+4. Include related financial concepts that might help find the answer
+
+Rewritten search query:"""
+
+            # Use the Responses API to rewrite the query
+            response = self.client.responses.create(
+                model=self.model,
+                input=rewrite_prompt
+            )
+            
+            # Extract the rewritten query
+            rewritten_query = ""
+            for output in response.output:
+                if hasattr(output, 'content') and output.content:
+                    for content in output.content:
+                        if hasattr(content, 'text'):
+                            rewritten_query += content.text + " "
+            
+            rewritten_query = rewritten_query.strip()
+            
+            if rewritten_query:
+                logger.debug(f"Query rewritten from: '{original_query}' to: '{rewritten_query}'")
+                return rewritten_query
+            else:
+                logger.warning("Query rewriting failed, using original query")
+                return original_query
+                
+        except Exception as e:
+            logger.error(f"Error in query rewriting: {e}")
+            return original_query
+            
+    def extract_search_results(self, response) -> Optional[List[Dict]]:
+        """
+        Extract file search results from the OpenAI response
+        
+        Based on OpenAI Responses API documentation, when using include=["output[*].file_search_call.search_results"],
+        the search results are accessible through the response output structure.
+        
+        Args:
+            response: OpenAI response object
+            
+        Returns:
+            List of search result dictionaries, or None if not available
+        """
+        try:
+            search_results = []
+            logger.debug("Starting search result extraction...")
+            
+            # According to the documentation, when include=["output[*].file_search_call.search_results"] is used,
+            # the search results should be available in the response output
+            if hasattr(response, 'output') and response.output:
+                for output_item in response.output:
+                    # Look for file_search_call type in output
+                    if hasattr(output_item, 'type') and output_item.type == 'file_search_call':
+                        logger.debug(f"Found file_search_call output: {type(output_item)}")
+                        # Check if there are results in this output (note: it's 'results', not 'search_results')
+                        if hasattr(output_item, 'results'):
+                            logger.debug(f"Found results attribute with {len(output_item.results)} results")
+                            for result in output_item.results:
+                                result_dict = self._extract_single_result(result)
+                                if result_dict:
+                                    search_results.append(result_dict)
+                        else:
+                            logger.debug(f"file_search_call found but no results attribute. Available attributes: {[attr for attr in dir(output_item) if not attr.startswith('_')]}")
+                    
+                    # Also check if this output has annotations (alternative way search results might be exposed)
+                    elif hasattr(output_item, 'content') and output_item.content:
+                        for content_item in output_item.content:
+                            if hasattr(content_item, 'annotations') and content_item.annotations:
+                                logger.debug(f"Found annotations in content: {len(content_item.annotations)} items")
+                                for annotation in content_item.annotations:
+                                    if hasattr(annotation, 'filename'):  # This indicates it's a file search result
+                                        result_dict = self._extract_single_result(annotation)
+                                        if result_dict:
+                                            search_results.append(result_dict)
+            
+            # If no results found through output, try alternative approach
+            if not search_results:
+                logger.debug("No search results found in output, trying alternative extraction...")
+                # Sometimes the include data might be in a separate attribute
+                for attr_name in ['include', 'included', 'search_results', 'tool_results']:
+                    if hasattr(response, attr_name):
+                        attr_value = getattr(response, attr_name)
+                        logger.debug(f"Checking {attr_name}: {type(attr_value)}")
+                        if attr_value:
+                            self._deep_inspect_response(attr_value, depth=0, max_depth=2)
+            
+            # Log final results
+            if search_results:
+                logger.debug(f"Successfully extracted {len(search_results)} search results")
+                for i, result in enumerate(search_results):
+                    logger.debug(f"Result {i}: {list(result.keys())}")
+            else:
+                logger.warning("No search results found in response - extraction failed")
+                # Log the full response structure for debugging
+                logger.debug("=== FULL RESPONSE DEBUG ===")
+                logger.debug(f"Response type: {type(response)}")
+                logger.debug(f"Response attributes: {[attr for attr in dir(response) if not attr.startswith('_')]}")
+                if hasattr(response, 'output'):
+                    logger.debug(f"Output length: {len(response.output)}")
+                    for i, output in enumerate(response.output):
+                        logger.debug(f"Output {i} type: {getattr(output, 'type', 'no type')}")
+                        logger.debug(f"Output {i} attributes: {[attr for attr in dir(output) if not attr.startswith('_')]}")
+                logger.debug("=== END RESPONSE DEBUG ===")
+                
+            return search_results if search_results else None
+            
+        except Exception as e:
+            logger.error(f"Error extracting search results: {e}")
+            import traceback
+            logger.debug(f"Full error traceback: {traceback.format_exc()}")
+            return None
+    
+    def _extract_single_result(self, result) -> Optional[Dict]:
+        """Extract a single search result into a dictionary"""
+        try:
+            result_dict = {}
+            
+            # Try different possible attribute names for file information
+            for attr_name in ['file_id', 'id', 'document_id']:
+                if hasattr(result, attr_name):
+                    result_dict['file_id'] = getattr(result, attr_name)
+                    break
+                    
+            for attr_name in ['file_name', 'filename', 'name', 'title']:
+                if hasattr(result, attr_name):
+                    result_dict['file_name'] = getattr(result, attr_name)
+                    break
+                    
+            for attr_name in ['content', 'text', 'snippet', 'excerpt']:
+                if hasattr(result, attr_name):
+                    content_val = getattr(result, attr_name)
+                    # Handle content that might be a list or direct text
+                    if isinstance(content_val, list) and len(content_val) > 0:
+                        result_dict['content'] = content_val[0].get('text', str(content_val[0])) if hasattr(content_val[0], 'get') else str(content_val[0])
+                    else:
+                        result_dict['content'] = str(content_val)
+                    break
+                    
+            for attr_name in ['score', 'relevance', 'confidence']:
+                if hasattr(result, attr_name):
+                    result_dict['score'] = getattr(result, attr_name)
+                    break
+            
+            # If we found any data, return it
+            if result_dict:
+                logger.debug(f"Extracted result attributes: {list(result_dict.keys())}")
+                return result_dict
+            else:
+                logger.debug(f"No extractable attributes found in result: {[attr for attr in dir(result) if not attr.startswith('_')]}")
+                return None
+            
+        except Exception as e:
+            logger.debug(f"Error extracting single result: {e}")
+            return None
+    
+    def _deep_inspect_response(self, obj, depth=0, max_depth=3):
+        """Recursively inspect the response object to find search results"""
+        if depth > max_depth:
+            return
+            
+        indent = "  " * depth
+        logger.debug(f"{indent}Inspecting {type(obj)}")
+        
+        if hasattr(obj, '__dict__'):
+            for attr_name, attr_value in obj.__dict__.items():
+                if 'search' in attr_name.lower() or 'result' in attr_name.lower() or 'file' in attr_name.lower():
+                    logger.debug(f"{indent}Found interesting attribute: {attr_name} = {type(attr_value)}")
+                    if depth < max_depth and attr_value is not None:
+                        self._deep_inspect_response(attr_value, depth + 1, max_depth)
+                
     def evaluate_single_case(self, test_case: TestCase, case_index: int) -> EvalResult:
         """
         Evaluate a single test case using the Responses API
@@ -340,9 +557,30 @@ class DocFinQAEvaluator:
                 f"docfinqa-case-{case_index}"        # Give it a unique name
             )
             
-            # === STEP 2: USE RESPONSES API WITH FILE_SEARCH ===
+            # === STEP 2: OPTIONALLY REWRITE QUERY ===
+            # If query rewriting is enabled, rewrite the question for better search
+            search_question = test_case.question
+            if self.use_query_rewriting:
+                search_question = self.rewrite_query(test_case.question)
+            
+            # === STEP 3: USE RESPONSES API WITH FILE_SEARCH ===
             # Create a formatted prompt with the question and instructions
-            prompt = f"""### Question
+            if self.use_query_rewriting:
+                prompt = f"""### Original Question
+{test_case.question}
+
+### Search Query Used
+{search_question}
+
+### Instructions
+Use the file_search tool to find information from the uploaded financial document to answer the original question.
+The search query above has been optimized for better document search.
+
+Work step by step under the header REASONING: and explain your thinking.
+Finish with a single line with only your numerical or logical answer under the header FINAL: <answer>
+"""
+            else:
+                prompt = f"""### Question
 {test_case.question}
 
 ### Instructions
@@ -352,15 +590,23 @@ Work step by step under the header REASONING: and explain your thinking.
 Finish with a single line with only your numerical or logical answer under the header FINAL: <answer>
 """
             
-            # Use the Responses API with file_search tool
-            response = self.client.responses.create(
-                model=self.model,
-                input=prompt,
-                tools=[{
+            # Prepare the API call parameters
+            api_params = {
+                "model": self.model,
+                "input": prompt,
+                "tools": [{
                     "type": "file_search",
                     "vector_store_ids": [vector_store_id]
                 }]
-            )
+            }
+            
+            # Add include parameter if search results are requested
+            # Based on the documentation, this should include search results in the response
+            if self.include_search_results:
+                api_params["include"] = ["output[*].file_search_call.search_results"]
+            
+            # Use the Responses API with file_search tool
+            response = self.client.responses.create(**api_params)
             
             response_id = response.id
             
@@ -374,7 +620,19 @@ Finish with a single line with only your numerical or logical answer under the h
             
             model_response = model_response.strip()
             
-            # === STEP 3: SCORE THE RESPONSE ===
+            # === STEP 4: EXTRACT SEARCH RESULTS (IF ENABLED) ===
+            search_results = None
+            rewritten_query = None
+            
+            if self.include_search_results:
+                logger.debug("=== ATTEMPTING SEARCH RESULTS EXTRACTION ===")
+                search_results = self.extract_search_results(response)
+                logger.debug(f"Extraction completed. Results: {search_results is not None}")
+                
+            if self.use_query_rewriting:
+                rewritten_query = search_question
+            
+            # === STEP 5: SCORE THE RESPONSE ===
             # Use our custom scoring system to evaluate the response
             scoring_result = score_response(model_response, test_case.expected_answer)
             
@@ -395,7 +653,10 @@ Finish with a single line with only your numerical or logical answer under the h
                 numerical_accuracy=scoring_result.numerical_accuracy,
                 extracted_number=scoring_result.extracted_number,
                 expected_number=scoring_result.expected_number,
-                found_final_tag=scoring_result.found_final_tag
+                found_final_tag=scoring_result.found_final_tag,
+                # Search information (if enabled)
+                rewritten_query=rewritten_query,
+                search_results=search_results
             )
             
         except Exception as e:
@@ -538,6 +799,11 @@ Finish with a single line with only your numerical or logical answer under the h
             metrics: Evaluation metrics
             output_file: Path to output file
         """
+        # Ensure the output directory exists
+        output_dir = os.path.dirname(output_file)
+        if output_dir:  # Only create directory if there's a path component
+            os.makedirs(output_dir, exist_ok=True)
+            
         output_data = {
             'metadata': metrics,
             'results': []
@@ -557,7 +823,10 @@ Finish with a single line with only your numerical or logical answer under the h
                 'numerical_accuracy': result.numerical_accuracy,
                 'extracted_number': result.extracted_number,
                 'expected_number': result.expected_number,
-                'found_final_tag': result.found_final_tag
+                'found_final_tag': result.found_final_tag,
+                # Search information (if available)
+                'rewritten_query': result.rewritten_query,
+                'search_results': result.search_results
             }
             output_data['results'].append(result_data)
             
@@ -568,12 +837,20 @@ Finish with a single line with only your numerical or logical answer under the h
 
 def main():
     """Main entry point for the evaluation script"""
+    # Create results directory if it doesn't exist
+    results_dir = 'results'
+    os.makedirs(results_dir, exist_ok=True)
+    
+    # Generate default timestamped filename
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    default_output = os.path.join(results_dir, f'docfinqa_eval_{timestamp}.json')
+    
     parser = argparse.ArgumentParser(description='DocFinQA Evaluation using OpenAI Responses API (Agents SDK)')
     parser.add_argument('--data', '-d', 
                        default='data/test-data-sample.json',
                        help='Path to test data JSON file')
     parser.add_argument('--output', '-o',
-                       default='eval_results.json',
+                       default=default_output,
                        help='Path to output results file')
     parser.add_argument('--limit', '-l',
                        type=int,
@@ -581,6 +858,12 @@ def main():
     parser.add_argument('--model', '-m',
                        default=None,
                        help='OpenAI model to use (overrides env var)')
+    parser.add_argument('--rewrite-queries', 
+                       action='store_true',
+                       help='Enable query rewriting for better document search')
+    parser.add_argument('--include-search-results', 
+                       action='store_true',
+                       help='Include file search results in the response and save them in the JSON output')
     
     args = parser.parse_args()
     
@@ -591,7 +874,11 @@ def main():
         
     try:
         # Initialize evaluator
-        evaluator = DocFinQAEvaluator(model=args.model)
+        evaluator = DocFinQAEvaluator(
+            model=args.model, 
+            use_query_rewriting=args.rewrite_queries,
+            include_search_results=args.include_search_results
+        )
         
         # Load test data
         test_cases = evaluator.load_test_data(args.data, args.limit)
